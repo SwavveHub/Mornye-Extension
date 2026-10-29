@@ -762,20 +762,6 @@ function extractYouTubeVisitorData(text) {
   return "";
 }
 
-function extractYouTubePlayerURL(text) {
-  var html = String(text || "");
-  var match =
-    html.match(/"jsUrl"\s*:\s*"([^"]+)"/) ||
-    html.match(/"PLAYER_JS_URL"\s*:\s*"([^"]+)"/) ||
-    html.match(/(\/s\/player\/[^"']+\/base\.js)/);
-  if (!match) return "";
-  var playerURL = String(match[1] || match[0] || "").replace(/\\\//g, "/");
-  if (!playerURL) return "";
-  if (playerURL.indexOf("//") === 0) return "https:" + playerURL;
-  if (playerURL.charAt(0) === "/") return "https://www.youtube.com" + playerURL;
-  return /^https?:\/\//i.test(playerURL) ? playerURL : "";
-}
-
 function getYouTubePageInfo(videoID) {
   var cacheKey = "youtube:pageinfo:" + String(videoID || "");
   var cached = cacheGet(cacheKey);
@@ -797,7 +783,7 @@ function getYouTubePageInfo(videoID) {
       "[InnerTube] visitorData page failed:",
       res ? res.status : "no response",
     );
-    return { visitorData: "", playerUrl: "" };
+    return { visitorData: "", signatureTimestamp: 0 };
   }
 
   var html = "";
@@ -806,242 +792,36 @@ function getYouTubePageInfo(videoID) {
   } catch (e) {
     html = "";
   }
+  var timestamp = html.match(/["']?(?:signatureTimestamp|sts)["']?\s*:\s*(\d{5})/);
   var pageInfo = {
     visitorData: extractYouTubeVisitorData(html),
-    playerUrl: extractYouTubePlayerURL(html),
+    signatureTimestamp: timestamp ? Number(timestamp[1]) : 0,
   };
-  if (pageInfo.visitorData || pageInfo.playerUrl) cacheSet(cacheKey, pageInfo);
+  if (pageInfo.visitorData || pageInfo.signatureTimestamp) cacheSet(cacheKey, pageInfo);
   return pageInfo;
 }
 
-function getGlobalRoot() {
-  try {
-    if (typeof globalThis !== "undefined") return globalThis;
-  } catch (e) {}
-  return (function () {
-    return this;
-  })();
-}
-
-function loadYouTubePlayerJS(playerUrl) {
-  var url = String(playerUrl || "").trim();
-  if (!url) return "";
-  var cacheKey = "youtube:playerjs:" + url;
-  var cached = cacheGet(cacheKey);
-  if (cached) return cached;
-
-  var res = fetch(url, {
-    method: "GET",
-    headers: {
-      Accept: "application/javascript,text/javascript,*/*",
-      "User-Agent": getRandomUserAgent(),
-    },
-  });
-  if (!res || !res.ok) {
-    L(
-      "warn",
-      "[InnerTube] player JS failed:",
-      res ? res.status : "no response",
-    );
-    return "";
-  }
-
-  var js = "";
-  try {
-    js = res.text();
-  } catch (e) {
-    js = "";
-  }
-  if (js) cacheSet(cacheKey, js);
-  return js;
-}
-
-function findYouTubeURLTransformFunction(playerJS) {
-  var text = String(playerJS || "");
-  var marker = /\.set\(\s*["']alr["']\s*,\s*["']yes["']\s*\)/g.exec(text);
-  if (!marker) return "";
-
-  var prefix = text.substring(Math.max(0, marker.index - 12000), marker.index);
-  var patterns = [
-    /(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*function\s*\([^)]*\)\s*\{/g,
-    /function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g,
-    /([A-Za-z_$][\w$]*)\s*=\s*function\s*\([^)]*\)\s*\{/g,
-  ];
-  var best = "";
-  for (var pi = 0; pi < patterns.length; pi++) {
-    var pattern = patterns[pi];
-    var match;
-    while ((match = pattern.exec(prefix))) {
-      if (match[1]) best = match[1];
-    }
-  }
-  return best;
-}
-
-function buildYouTubeChallengeSolver(playerJS) {
-  var text = String(playerJS || "");
-  var transformFn = findYouTubeURLTransformFunction(text);
-  if (!transformFn) return null;
-
-  var marker = ";})(_yt_player);";
-  var markerIndex = text.lastIndexOf(marker);
-  if (markerIndex < 0) {
-    marker = "})(_yt_player);";
-    markerIndex = text.lastIndexOf(marker);
-  }
-  if (markerIndex < 0) return null;
-
-  var injection =
-    ';(function(){var root=typeof globalThis!=="undefined"?globalThis:this;' +
-    "root.__mornyeYtChallengeSolver=function(sig,n){var result={};" +
-    "var url=" +
-    transformFn +
-    '("https://www.youtube.com/watch?v=yt-dlp-wins","s",sig?encodeURIComponent(sig):void 0);' +
-    'if(n){url.set("n",n);var proto=Object.getPrototypeOf(url);var names=Object.getOwnPropertyNames(proto);' +
-    "for(var i=0;i<names.length;i++){var name=names[i];" +
-    'if(name==="constructor"||name==="set"||name==="get"||name==="clone")continue;' +
-    'if(typeof url[name]!=="function")continue;' +
-    "try{url[name](url);break}catch(e){try{url[name]();break}catch(e2){}}}}" +
-    'if(sig)result.sig=decodeURIComponent(url.get("s")||url.get("sig")||url.get("signature")||"");' +
-    'if(n)result.n=url.get("n")||"";return result};})();';
-
-  var root = getGlobalRoot();
-  var previous = {};
-  var had = {};
-  function setStub(name, value) {
-    had[name] = Object.prototype.hasOwnProperty.call(root, name);
-    previous[name] = root[name];
-    root[name] = value;
-  }
-
-  var xhr = function () {};
-  xhr.prototype.fetch = function () {};
-  var fakeDocument = {
-    createElement: function () {
-      return {};
-    },
-    querySelector: function () {
-      return null;
-    },
-    addEventListener: function () {},
-    removeEventListener: function () {},
-    body: {
-      appendChild: function () {},
-      removeChild: function () {},
-    },
-  };
-  var fakeWindow = {
-    location: { hostname: "www.youtube.com", href: "https://www.youtube.com/" },
-    addEventListener: function () {},
-    removeEventListener: function () {},
-    XMLHttpRequest: xhr,
-  };
-  fakeWindow.window = fakeWindow;
-  fakeWindow.document = fakeDocument;
-
-  setStub("window", fakeWindow);
-  setStub("document", fakeDocument);
-  setStub("location", fakeWindow.location);
-  setStub("navigator", { userAgent: getRandomUserAgent() });
-  setStub("XMLHttpRequest", xhr);
-  setStub("ytcfg", {
-    get: function () {
-      return null;
-    },
-    set: function () {},
-  });
-
-  try {
-    var script =
-      text.substring(0, markerIndex) + injection + text.substring(markerIndex);
-    eval(script);
-    var solver = root.__mornyeYtChallengeSolver;
-    return typeof solver === "function" ? solver : null;
-  } catch (e) {
-    L(
-      "warn",
-      "[InnerTube] player challenge solver failed:",
-      String((e && e.message) || e),
-    );
-    return null;
-  } finally {
-    try {
-      delete root.__mornyeYtChallengeSolver;
-    } catch (e2) {
-      root.__mornyeYtChallengeSolver = undefined;
-    }
-    for (var key in previous) {
-      if (!Object.prototype.hasOwnProperty.call(previous, key)) continue;
-      if (had[key]) root[key] = previous[key];
-      else {
-        try {
-          delete root[key];
-        } catch (e3) {
-          root[key] = undefined;
-        }
-      }
-    }
-  }
-}
-
-function solveYouTubePlayerChallenge(playerUrl, sig, n) {
-  var url = String(playerUrl || "").trim();
-  if (!url || (!sig && !n)) return {};
-
-  var cacheKey = "youtube:playersolver:" + url;
-  var solver = cacheGet(cacheKey);
-  if (!solver) {
-    var playerJS = loadYouTubePlayerJS(url);
-    if (!playerJS) return {};
-    solver = buildYouTubeChallengeSolver(playerJS);
-    if (!solver) return {};
-    cacheSet(cacheKey, solver);
-  }
-
-  try {
-    return solver(sig || "", n || "") || {};
-  } catch (e) {
-    L(
-      "warn",
-      "[InnerTube] challenge solve failed:",
-      String((e && e.message) || e),
-    );
-    return {};
-  }
-}
-
-function buildYouTubeFormatURL(fmt, playerUrl) {
+function buildYouTubeFormatURL(fmt) {
   if (!fmt) return "";
 
   var rawURL = String(fmt.url || "").trim();
   var cipher = fmt.signatureCipher || fmt.cipher;
   var encryptedSig = "";
-  var sigParam = "signature";
-
   if (!rawURL && cipher) {
     var parsedCipher = parseQueryString(cipher);
     rawURL = String(parsedCipher.url || "").trim();
     encryptedSig = String(parsedCipher.s || "").trim();
-    sigParam = String(parsedCipher.sp || "signature").trim() || "signature";
   }
   if (!rawURL) return "";
 
-  var solved = {};
+  // No isolated player solver is available here. Never evaluate downloaded
+  // code with extension privileges; let other formats/clients/fallbacks run.
   try {
     var parsed = new URL(rawURL);
-    var nValue = parsed.searchParams.get("n") || "";
-    if (encryptedSig || nValue) {
-      solved = solveYouTubePlayerChallenge(playerUrl, encryptedSig, nValue);
-    }
-    if (encryptedSig) {
-      var sigValue = solved.sig || "";
-      if (!sigValue) return "";
-      rawURL = updateUrlQuery(rawURL, { [sigParam]: sigValue });
-    }
-    if (nValue && solved.n) rawURL = updateUrlQuery(rawURL, { n: solved.n });
+    if (encryptedSig || parsed.searchParams.get("n")) return "";
     return rawURL;
   } catch (e) {
-    return encryptedSig ? "" : rawURL;
+    return "";
   }
 }
 
@@ -1049,26 +829,18 @@ function _tryInnerTubeClient(videoID, clientConfig, pageInfo, options) {
   options = options || {};
   pageInfo = pageInfo || {};
   var visitorData = pageInfo.visitorData || "";
-  var playerUrlForChallenges = pageInfo.playerUrl || "";
   var reqBody = JSON.parse(JSON.stringify(clientConfig.body));
   reqBody.videoId = videoID;
   // Request content to be served in a way compatible with external download
   reqBody.contentCheckOk = true;
   reqBody.racyCheckOk = true;
-  if (clientConfig.requiresJsPlayer && playerUrlForChallenges) {
-    if (pageInfo.signatureTimestamp === undefined) {
-      var playerCode = loadYouTubePlayerJS(playerUrlForChallenges);
-      var timestamp = playerCode.match(/(?:signatureTimestamp|sts)\s*:\s*(\d{5})/);
-      pageInfo.signatureTimestamp = timestamp ? Number(timestamp[1]) : 0;
-    }
-    if (pageInfo.signatureTimestamp) {
-      reqBody.playbackContext = {
-        contentPlaybackContext: {
-          html5Preference: "HTML5_PREF_WANTS",
-          signatureTimestamp: pageInfo.signatureTimestamp,
-        },
-      };
-    }
+  if (clientConfig.requiresJsPlayer && pageInfo.signatureTimestamp) {
+    reqBody.playbackContext = {
+      contentPlaybackContext: {
+        html5Preference: "HTML5_PREF_WANTS",
+        signatureTimestamp: pageInfo.signatureTimestamp,
+      },
+    };
   }
   if (visitorData) {
     reqBody.context.client.visitorData = visitorData;
@@ -1134,7 +906,7 @@ function _tryInnerTubeClient(videoID, clientConfig, pageInfo, options) {
     var bestAudio = chooseYouTubeFormat(remaining, clientConfig, !!gvsPoToken);
     if (!bestAudio) break;
     remaining.splice(remaining.indexOf(bestAudio), 1);
-    var bestAudioURL = buildYouTubeFormatURL(bestAudio, playerUrlForChallenges);
+    var bestAudioURL = buildYouTubeFormatURL(bestAudio);
     if (!bestAudioURL) continue;
     if (gvsPoToken && isGvsPoTokenRequiredFormat(bestAudio)) {
       bestAudioURL = updateUrlQuery(bestAudioURL, { pot: gvsPoToken });
@@ -1192,7 +964,7 @@ function requestInnerTubeAudioDownload(videoID) {
   // Returns the first client that gives us a valid audio URL.
   // No probe -- probing can invalidate single-use googlevideo URLs.
   var lastError = "";
-  var pageInfo = { visitorData: "", playerUrl: "" };
+  var pageInfo = { visitorData: "", signatureTimestamp: 0 };
   try {
     pageInfo = getYouTubePageInfo(videoID);
   } catch (pageErr) {
@@ -5650,6 +5422,31 @@ function getHomeFeed() {
   }
 }
 
+function normalizeYouTubeRecordingText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9\u0080-\uFFFF]+/g, " ")
+    .trim();
+}
+
+function youtubeTrackMatchesRequest(item, title, artist, durationMs) {
+  if (!item || (item.item_type || item.type) !== "track" || !/^[A-Za-z0-9_-]{11}$/.test(String(item.id || "")))
+    return false;
+  if (normalizeYouTubeRecordingText(item.name || item.title) !== normalizeYouTubeRecordingText(title))
+    return false;
+  var primaryArtist = /\s*,\s*|\s+feat\.?\s+|\s+ft\.?\s+/i;
+  var expectedArtist = normalizeYouTubeRecordingText(String(artist || "").split(primaryArtist)[0]);
+  var actualArtist = normalizeYouTubeRecordingText(String(item.artists || item.artist || "").split(primaryArtist)[0]);
+  if (!expectedArtist || expectedArtist !== actualArtist) return false;
+  if (durationMs > 0) {
+    var actualDurationMs = Number(item.duration_ms || 0) || Number(item.duration || 0) * 1000;
+    if (!(actualDurationMs > 0) || Math.abs(actualDurationMs - durationMs) > 5000)
+      return false;
+  }
+  return true;
+}
+
 registerExtension({
   initialize: function (settings) {
     settings = settings || {};
@@ -5713,16 +5510,11 @@ registerExtension({
   checkAvailability: function (isrc, trackName, artistName, options) {
     L("info", "[YTMusic] checkAvailability:", isrc, trackName, artistName);
 
-    var spotifyId = options && options.spotify_id ? options.spotify_id : null;
-    if (spotifyId && /^[A-Za-z0-9_-]{11}$/.test(spotifyId)) {
-      L("info", "[YTMusic] spotify_id looks like a video ID:", spotifyId);
-      return { available: true, track_id: spotifyId };
+    options = options || {};
+    if (!normalizeYouTubeRecordingText(trackName) || !normalizeYouTubeRecordingText(artistName)) {
+      return { available: false, reason: "missing_track_metadata" };
     }
-
-    var query = (artistName ? artistName + " " : "") + (trackName || "");
-    if (!query.trim()) {
-      return { available: false, reason: "no_search_query" };
-    }
+    var query = artistName + " " + trackName;
 
     try {
       var results = performSearchSync(query, YT_SEARCH_PARAMS.tracks);
@@ -5733,23 +5525,13 @@ registerExtension({
 
       for (var i = 0; i < results.length; i++) {
         var item = results[i];
-        if (
-          item &&
-          item.id &&
-          (item.item_type === "track" || item.type === "track")
-        ) {
+        if (youtubeTrackMatchesRequest(item, trackName, artistName, Number(options.duration_ms || 0))) {
           L("info", "[YTMusic] Found track:", item.id, item.name || item.title);
           return { available: true, track_id: item.id };
         }
       }
 
-      // Fallback: use first result regardless of type
-      if (results[0] && results[0].id) {
-        L("info", "[YTMusic] Using first result as fallback:", results[0].id);
-        return { available: true, track_id: results[0].id };
-      }
-
-      return { available: false, reason: "no_video_id_in_results" };
+      return { available: false, reason: "no_matching_track" };
     } catch (e) {
       L("error", "[YTMusic] checkAvailability error:", String(e));
       return { available: false, reason: "search_error: " + String(e) };
@@ -5774,7 +5556,7 @@ registerExtension({
     var downloadSource = "";
     var downloadOptions = {};
     var downloadCoverUrl = resolveDownloadCoverUrl(videoID);
-    var pageInfo = { visitorData: "", playerUrl: "" };
+    var pageInfo = { visitorData: "", signatureTimestamp: 0 };
     try {
       pageInfo = getYouTubePageInfo(videoID);
     } catch (pageErr) {

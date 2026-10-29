@@ -627,14 +627,15 @@ function customSearch(query, options) {
  * Returns { type, permalink_url } or null.
  */
 function parseSoundCloudURL(url) {
-  url = (url || "").trim();
-  if (!url) return null;
-
-  // Normalize mobile/short URLs
-  url = url.replace(/^https?:\/\/m\.soundcloud\.com/, "https://soundcloud.com");
-  // on.soundcloud.com short links need resolution
-  if (url.indexOf("on.soundcloud.com") !== -1) {
-    return { type: "resolve", permalink_url: url };
+  url = String(url || "").trim();
+  // Match the entire HTTPS authority, rejecting credentials, ports, lookalike
+  // hosts and backslashes before any request or API resolution.
+  var origin = url.match(/^https:\/\/(soundcloud\.com|m\.soundcloud\.com|on\.soundcloud\.com)(?=\/|[?#]|$)([^\s\\]*)$/i);
+  if (!origin) return null;
+  var host = origin[1].toLowerCase();
+  url = "https://" + (host === "m.soundcloud.com" ? "soundcloud.com" : host) + origin[2];
+  if (host === "on.soundcloud.com") {
+    return { type: "shortlink", permalink_url: url };
   }
 
   // https://soundcloud.com/{author}/sets/{slug}
@@ -671,52 +672,10 @@ function handleURL(url) {
     return { success: false, error: "Invalid SoundCloud URL" };
   }
 
-  // on.soundcloud.com short links are 302 redirects that the API can't resolve.
-  // Follow the redirect to get the real soundcloud.com URL first.
-  if (parsed.type === "resolve" && parsed.permalink_url.indexOf("on.soundcloud.com") !== -1) {
-    log.info("[SC] Resolving short link:", parsed.permalink_url);
-    try {
-      var redirectResp = http.get(parsed.permalink_url, {
-        "User-Agent": utils.randomUserAgent()
-      });
-      var finalUrl = "";
-
-      // Method 1: Use response.url (final URL after redirects, requires updated Go backend)
-      if (redirectResp && !redirectResp.error && redirectResp.url &&
-          redirectResp.url.indexOf("soundcloud.com") !== -1 &&
-          redirectResp.url.indexOf("on.soundcloud.com") === -1) {
-        finalUrl = redirectResp.url;
-        log.info("[SC] Got final URL from response.url");
-      }
-
-      // Method 2: Parse canonical URL from HTML body
-      if (!finalUrl && redirectResp && redirectResp.body) {
-        var canonMatch = redirectResp.body.match(/<link[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
-        if (!canonMatch) {
-          canonMatch = redirectResp.body.match(/<meta[^>]*property=["']og:url["'][^>]*content=["']([^"']+)["']/i);
-        }
-        if (canonMatch && canonMatch[1] && canonMatch[1].indexOf("soundcloud.com") !== -1) {
-          finalUrl = canonMatch[1];
-          log.info("[SC] Got final URL from HTML meta tag");
-        }
-      }
-
-      if (finalUrl) {
-        // Strip tracking params
-        var qIdx = finalUrl.indexOf("?");
-        if (qIdx !== -1) finalUrl = finalUrl.substring(0, qIdx);
-        log.info("[SC] Resolved short link ->", finalUrl);
-        parsed = parseSoundCloudURL(finalUrl);
-        if (!parsed) {
-          return { success: false, error: "Could not parse resolved URL: " + finalUrl };
-        }
-      } else {
-        log.warn("[SC] Could not extract final URL from short link response");
-      }
-    } catch (e) {
-      log.warn("[SC] Short link redirect failed:", e.message);
-      // Fall through — will try /resolve with original URL as last resort
-    }
+  // This extension has no per-hop origin guard for native HTTP redirects.
+  // Require a full permalink instead of fetching a user-supplied short link.
+  if (parsed.type === "shortlink") {
+    return { success: false, error: "Use a full https://soundcloud.com URL instead of a short link" };
   }
 
   try {

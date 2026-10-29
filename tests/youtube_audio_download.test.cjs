@@ -61,22 +61,26 @@ test('token query updates work with the app URL contract', () => {
   assert.equal(result.searchParams.has('empty'), false);
 });
 
-test('cipher signatures and n challenges are written into the download URL', () => {
+test('challenge-dependent formats are skipped without downloading player code', () => {
   const { c } = runtime();
-  c.solveYouTubePlayerChallenge = () => ({ sig: 'solved+signature', n: 'new_n' });
+  const requests = [];
+  c.fetch = url => {
+    requests.push(url);
+    throw new Error('Player code must never be requested');
+  };
   const cipher = new URLSearchParams({
     url: 'https://media.example.test/audio?keep=a%2Bb&n=old_n',
     s: 'encrypted', sp: 'sig',
   });
-  const result = new URL(c.buildYouTubeFormatURL({ signatureCipher: cipher.toString() }, 'player'));
-  assert.equal(result.searchParams.get('sig'), 'solved+signature');
-  assert.equal(result.searchParams.get('n'), 'new_n');
-  assert.equal(result.searchParams.get('keep'), 'a+b');
+  for (const player of ['https://www.youtube.com/s/player/test/base.js', 'http://unrelated.test/base.js']) {
+    assert.equal(c.buildYouTubeFormatURL({ signatureCipher: cipher.toString() }, player), '');
+    assert.equal(c.buildYouTubeFormatURL({ url: 'https://media.example.test/audio?n=challenge' }, player), '');
+  }
+  assert.deepEqual(requests, []);
 });
 
-test('unsigned cipher URLs are not used after solving fails', () => {
+test('unsigned cipher URLs are never used', () => {
   const { c } = runtime();
-  c.solveYouTubePlayerChallenge = () => ({});
   const cipher = new URLSearchParams({ url: 'https://media.example.test/audio', s: 'encrypted' });
   assert.equal(c.buildYouTubeFormatURL({ signatureCipher: cipher.toString() }, 'player'), '');
 });
@@ -91,6 +95,39 @@ test('a broken signature on the first format does not discard other Opus audio',
   const result = c._tryInnerTubeClient('test-video', c.INNERTUBE_CLIENTS[0], {});
   assert.equal(result.itag, 250);
   assert.equal(result.extension, '.opus');
+});
+
+test('the download falls back when all direct formats require player challenges', () => {
+  const { c, calls, extension } = runtime();
+  const watchURL = vm.runInContext('CONFIG.youtubeWatchURL', c);
+  c.INNERTUBE_CLIENTS = [c.INNERTUBE_CLIENTS[0]];
+  const requests = [];
+  c.fetch = (url, options) => {
+    requests.push(url);
+    if (url === watchURL + 'abcdefghijk') {
+      return { ok: true, text: () => '{"jsUrl":"https://unrelated.test/base.js"}' };
+    }
+    assert.equal(options.method, 'POST');
+    assert.equal(new URL(url).origin, 'https://www.youtube.com');
+    return { ok: true, json: () => ({
+      playabilityStatus: { status: 'OK' },
+      streamingData: { adaptiveFormats: [
+        audio(251, 'opus', { url: '', signatureCipher: 's=encrypted&url=https%3A%2F%2Fmedia.example.test%2Faudio' }),
+        audio(250, 'opus', { url: 'https://media.example.test/audio?n=challenge' }),
+      ] },
+    }) };
+  };
+  const fallbacks = [];
+  c.requestCobaltAudioDownload = url => {
+    fallbacks.push(url);
+    return { url: 'https://media.example.test/fallback', extension: '.opus' };
+  };
+  const result = extension.download('abcdefghijk', 'opus', '/music/song.flac');
+  assert.equal(result.success, true);
+  assert.equal(result.audio_codec, 'opus');
+  assert.deepEqual(fallbacks, ['https://music.youtube.com/watch?v=abcdefghijk']);
+  assert.deepEqual(calls.downloads, [{ url: 'https://media.example.test/fallback', output: '/music/song.opus' }]);
+  assert.equal(requests.length, 2, 'only the watch page and player API are fetched');
 });
 
 test('Opus from a later client wins over earlier AAC without downloading AAC', () => {
@@ -189,15 +226,21 @@ test('PO token refresh is inserted into the real media URL and can recover 403',
   assert.deepEqual(calls.downloads.map(url => new URL(url).searchParams.get('pot')), ['old_token', 'new_token']);
 });
 
-test('JS clients send the current player timestamp and share the player cache', () => {
+test('JS clients read the timestamp as page data without fetching or executing player code', () => {
   const { c } = runtime();
-  let scripts = 0;
+  const watchURL = vm.runInContext('CONFIG.youtubeWatchURL', c);
+  let pages = 0;
   let requests = 0;
+  const privilegedCalls = [];
+  c.storage.set = () => privilegedCalls.push('storage');
+  c.file.delete = () => privilegedCalls.push('file');
   c.fetch = (url, options) => {
-    if (url.endsWith('/base.js')) {
-      scripts++;
-      return { ok: true, text: () => 'var config={signatureTimestamp:20849};' };
+    if (url === watchURL + 'id') {
+      pages++;
+      return { ok: true, text: () => '{"signatureTimestamp":20849,"jsUrl":"http://unrelated.test/base.js"}' };
     }
+    assert.equal(options.method, 'POST', 'never GET a player script, including on an allowed origin');
+    assert.equal(new URL(url).origin, 'https://www.youtube.com');
     requests++;
     assert.equal(JSON.parse(options.body).playbackContext.contentPlaybackContext.signatureTimestamp, 20849);
     return { ok: true, json: () => ({
@@ -205,10 +248,11 @@ test('JS clients send the current player timestamp and share the player cache', 
       streamingData: { adaptiveFormats: [audio(251, 'opus')] },
     }) };
   };
-  const page = { playerUrl: 'https://www.youtube.com/s/player/example/base.js' };
+  const page = c.getYouTubePageInfo('id');
   for (const client of c.INNERTUBE_CLIENTS.filter(client => client.requiresJsPlayer)) {
     assert.equal(c._tryInnerTubeClient('id', client, page).extension, '.opus');
   }
-  assert.equal(scripts, 1);
+  assert.equal(pages, 1);
   assert.equal(requests, 2);
+  assert.deepEqual(privilegedCalls, []);
 });
